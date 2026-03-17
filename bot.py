@@ -3,101 +3,72 @@ from discord.ext import commands, tasks
 import aiohttp
 import asyncio
 import os
-from datetime import datetime
+import random
+import string
 import json
+from datetime import datetime
+import itertools
 
 # ===== CONFIG =====
-TOKEN = os.environ.get('TOKEN')  # Your bot token
+TOKEN = os.environ.get('TOKEN')  # Your BOT token
 YOUR_USER_ID = 361069640962801664  # Your Discord ID
-CHECK_INTERVAL = 30  # Seconds between checks for monitored usernames
 
 # ===== BOT SETUP =====
 intents = discord.Intents.default()
 intents.dm_messages = True
-bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)  # Disable default help
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
-# Store monitored usernames and notification status
-monitored_usernames = {}  # {username: {"notified": False, "added_by": user_id, "added_at": timestamp}}
-data_file = 'monitored_usernames.json'
+# Store settings and results
+available_usernames = []
+scanning_active = False
+scan_type = None  # 'generate' or 'list'
+scan_length = 0
+scan_amount = 0
+current_progress = 0
+total_to_scan = 0
+scan_start_time = None
+delay_between_checks = 2  # seconds
 
-# Load saved data
-def load_data():
-    global monitored_usernames
-    try:
-        if os.path.exists(data_file):
-            with open(data_file, 'r') as f:
-                monitored_usernames = json.load(f)
-                print(f"📂 Loaded {len(monitored_usernames)} monitored usernames")
-    except Exception as e:
-        print(f"Error loading data: {e}")
-        monitored_usernames = {}
-
-def save_data():
-    try:
-        with open(data_file, 'w') as f:
-            json.dump(monitored_usernames, f, indent=2)
-    except Exception as e:
-        print(f"Error saving data: {e}")
-
-# Load on startup
-load_data()
+# Character sets (from DSV)
+LETTERS = string.ascii_lowercase
+DIGITS = string.digits
+PUNCTUATION = "_."  # Discord allows underscore and period
 
 async def check_username_availability(username):
     """
-    RELIABLE username checker using Discord's register endpoint.
-    This actually works and doesn't give false negatives.
+    DSV's username checking method using Discord's pomelo-attempt endpoint
     """
-    # Basic validation
-    if len(username) < 2 or len(username) > 32:
-        return {"available": False, "reason": "invalid_length", "message": "Username must be 2-32 characters"}
-    
-    # Check for valid characters (letters, numbers, underscore only)
-    if not all(c.isalnum() or c == '_' for c in username):
-        return {"available": False, "reason": "invalid_chars", "message": "Username can only contain letters, numbers, and underscores"}
-    
-    # Use Discord's register endpoint - this is what the client uses
-    url = "https://discord.com/api/v9/auth/register"
+    url = "https://discord.com/api/v9/users/@me/pomelo-attempt"
     headers = {
+        'Authorization': f'Bot {TOKEN}',
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'Origin': 'https://discord.com/'
     }
     
-    # We're not actually registering, just checking availability
-    payload = {
-        'username': username,
-        'password': 'TempPassword123!@#',  # Dummy password
-        'consent': True,
-        'date_of_birth': '2000-01-01'
-    }
+    payload = {'username': username}
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json=payload) as response:
-                # 201 Created = username is available
-                if response.status == 201:
-                    return {"available": True, "reason": "available", "message": "Username is available!"}
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('taken') is False:
+                        return {"available": True, "reason": "available", "message": "Username is available!"}
+                    elif data.get('taken') is True:
+                        return {"available": False, "reason": "taken", "message": "Username is already taken"}
+                    else:
+                        return {"available": False, "reason": "unknown", "message": "Unknown response"}
                 
-                # 400 Bad Request = username is taken or invalid
                 elif response.status == 400:
                     try:
-                        error_data = await response.json()
-                        error_text = str(error_data).lower()
-                        
-                        # Check for specific error messages
-                        if "taken" in error_text:
-                            return {"available": False, "reason": "taken", "message": "Username is already taken"}
-                        elif "invalid" in error_text:
-                            return {"available": False, "reason": "invalid", "message": "Username contains invalid characters"}
-                        elif "blacklist" in error_text or "banned" in error_text:
-                            return {"available": False, "reason": "blacklisted", "message": "Username contains prohibited words"}
-                        elif "age" in error_text:
-                            return {"available": False, "reason": "age_restricted", "message": "Username may be age-restricted"}
+                        data = await response.json()
+                        if 'taken' in str(data).lower():
+                            return {"available": False, "reason": "taken", "message": "Username is taken"}
                         else:
-                            return {"available": False, "reason": "unavailable", "message": "Username is not available"}
+                            return {"available": False, "reason": "invalid", "message": data.get('message', 'Invalid username')}
                     except:
-                        return {"available": False, "reason": "unavailable", "message": "Username is not available"}
+                        return {"available": False, "reason": "error", "message": "Bad request"}
                 
-                # 429 = rate limited
                 elif response.status == 429:
                     retry_after = int(response.headers.get('Retry-After', 5))
                     await asyncio.sleep(retry_after)
@@ -110,72 +81,72 @@ async def check_username_availability(username):
         print(f"Error checking {username}: {e}")
         return {"available": False, "reason": "exception", "message": f"Error: {str(e)}"}
 
-async def send_instant_notification(username):
-    """Send urgent DM that username is now available"""
+def generate_username(length, use_letters=True, use_digits=False, use_punctuation=False):
+    """Generate a random username based on DSV's method"""
+    chars = ""
+    if use_letters:
+        chars += LETTERS
+    if use_digits:
+        chars += DIGITS
+    if use_punctuation:
+        chars += PUNCTUATION
+    
+    return ''.join(random.sample(chars, length))
+
+async def send_dm_result(username, result):
+    """Send result to user's DM"""
     try:
         user = await bot.fetch_user(YOUR_USER_ID)
-        embed = discord.Embed(
-            title="🚨 **USERNAME JUST BECAME AVAILABLE!**",
-            description=f"**{username}** can now be claimed!",
-            color=0x00ff00,
-            timestamp=datetime.now()
-        )
-        embed.add_field(
-            name="⏱️ Action Required",
-            value=f"[CLAIM IT NOW!](https://discord.com/settings/profile)\nBe quick—someone else might snipe it!",
-            inline=False
-        )
-        embed.set_footer(text="Username Hunter Bot")
-        
-        await user.send(embed=embed)
-        return True
-    except Exception as e:
-        print(f"Failed to send notification: {e}")
-        return False
-
-# ===== BACKGROUND TASK =====
-@tasks.loop(seconds=CHECK_INTERVAL)
-async def monitor_usernames():
-    """Constantly check all monitored usernames"""
-    if not monitored_usernames:
-        return
-    
-    print(f"🔍 Checking {len(monitored_usernames)} monitored usernames...")
-    
-    for username, data in list(monitored_usernames.items()):
-        # Skip if already notified
-        if data.get('notified', False):
-            continue
-            
-        result = await check_username_availability(username)
         
         if result["available"]:
-            # Send notification
-            await send_instant_notification(username)
-            
-            # Mark as notified
-            monitored_usernames[username]['notified'] = True
-            monitored_usernames[username]['available_at'] = datetime.now().isoformat()
-            monitored_usernames[username]['message'] = result['message']
-            save_data()
-            
-            print(f"✅ {username} is now AVAILABLE - notification sent")
+            embed = discord.Embed(
+                title="✅ USERNAME AVAILABLE!",
+                description=f"**{username}**",
+                color=0x00ff00,
+                timestamp=datetime.now()
+            )
+            embed.add_field(name="Action", value="[Claim it now!](https://discord.com/settings/profile)", inline=False)
+        else:
+            embed = discord.Embed(
+                title="❌ Username Taken",
+                description=f"**{username}** - {result['message']}",
+                color=0xff0000,
+                timestamp=datetime.now()
+            )
         
-        # Small delay between checks to be nice
-        await asyncio.sleep(2)
+        await user.send(embed=embed)
+    except Exception as e:
+        print(f"Failed to send DM: {e}")
 
-@monitor_usernames.before_loop
-async def before_monitor():
-    await bot.wait_until_ready()
+async def send_progress_update():
+    """Send progress update to DM"""
+    try:
+        user = await bot.fetch_user(YOUR_USER_ID)
+        
+        elapsed = datetime.now() - scan_start_time
+        elapsed_str = str(elapsed).split('.')[0]  # Remove microseconds
+        
+        percent = (current_progress / total_to_scan) * 100 if total_to_scan > 0 else 0
+        
+        embed = discord.Embed(
+            title="📊 Scan Progress",
+            description=f"**Type:** {'Generating' if scan_type == 'generate' else 'Checking list'}\n"
+                       f"**Progress:** {current_progress}/{total_to_scan} ({percent:.1f}%)\n"
+                       f"**Found:** {len(available_usernames)} available\n"
+                       f"**Elapsed:** {elapsed_str}\n"
+                       f"**Delay:** {delay_between_checks}s",
+            color=0x3498db
+        )
+        
+        await user.send(embed=embed)
+    except Exception as e:
+        print(f"Failed to send progress: {e}")
 
-# ===== EVENTS =====
 @bot.event
 async def on_ready():
-    print(f"✅ Username Hunter Bot Online")
+    print(f"✅ DSV Bot Online")
     print(f"🤖 Bot: {bot.user.name}")
     print(f"👑 Owner: <@{YOUR_USER_ID}>")
-    print(f"📊 Monitoring: {len(monitored_usernames)} usernames")
-    print(f"⏱️  Check interval: {CHECK_INTERVAL} seconds")
     
     # Set streaming status
     await bot.change_presence(activity=discord.Streaming(
@@ -183,181 +154,283 @@ async def on_ready():
         url="https://www.twitch.tv/umar"
     ))
     
-    # Send startup notification
+    # Send startup message
     try:
         user = await bot.fetch_user(YOUR_USER_ID)
-        await user.send(f"✅ **Username Hunter Online**\nMonitoring {len(monitored_usernames)} usernames\nInterval: {CHECK_INTERVAL}s")
+        await user.send(
+            "**🔍 DSV Username Checker Bot Ready!**\n\n"
+            "**Commands:**\n"
+            "`!scan <length> <amount>` - Generate and check random usernames\n"
+            "`!scanlist` - Check usernames from usernames.txt\n"
+            "`!stop` - Stop current scan\n"
+            "`!progress` - Show current progress\n"
+            "`!results` - Show all found usernames\n"
+            "`!setdelay <seconds>` - Set delay between checks\n"
+            "`!config` - Show current settings\n"
+            "`!commands` - Show this menu"
+        )
     except:
         pass
-    
-    # Start monitoring
-    monitor_usernames.start()
 
-# ===== COMMANDS =====
-@bot.command(name='incheck')
-async def incheck(ctx, username: str):
+@tasks.loop(seconds=1)
+async def scan_task():
+    global scanning_active, current_progress, available_usernames
+    
+    if not scanning_active:
+        return
+    
+    # This is just a placeholder - actual scanning is done in the commands
+    # to maintain proper async flow
+    pass
+
+@bot.command(name='scan')
+async def scan_generate(ctx, length: int = None, amount: int = None):
+    """Generate and scan random usernames
+    Usage: !scan 4 1000 (checks 1000 random 4-letter usernames)
     """
-    Add a username to monitor - will DM you instantly when available
-    Usage: !incheck wnrk
-    """
+    global scanning_active, scan_type, scan_length, scan_amount, current_progress, total_to_scan, scan_start_time, available_usernames
+    
     if ctx.author.id != YOUR_USER_ID:
         return
     
-    username = username.lower().strip()
-    
-    # Basic validation
-    if not username:
-        await ctx.send("❌ Please provide a username")
+    if scanning_active:
+        await ctx.send("❌ A scan is already in progress. Use `!stop` first.")
         return
     
-    if len(username) < 2 or len(username) > 32:
-        await ctx.send("❌ Username must be between 2-32 characters")
+    if not length or not amount:
+        await ctx.send("❌ Usage: `!scan <length> <amount>`\nExample: `!scan 4 1000`")
         return
     
-    # Check if already monitoring
-    if username in monitored_usernames:
-        await ctx.send(f"⚠️ Already monitoring `{username}`")
+    if length < 2 or length > 32:
+        await ctx.send("❌ Length must be between 2-32 characters")
         return
     
-    # Add to monitoring
-    monitored_usernames[username] = {
-        "notified": False,
-        "added_by": ctx.author.id,
-        "added_at": datetime.now().isoformat()
-    }
-    save_data()
-    
-    await ctx.send(f"✅ Now monitoring `{username}` - I'll DM you the instant it becomes available!")
-
-@bot.command(name='uncheck')
-async def uncheck(ctx, username: str):
-    """
-    Stop monitoring a username
-    Usage: !uncheck wnrk
-    """
-    if ctx.author.id != YOUR_USER_ID:
+    if amount < 1 or amount > 10000:
+        await ctx.send("❌ Amount must be between 1-10000")
         return
     
-    username = username.lower().strip()
+    scanning_active = True
+    scan_type = 'generate'
+    scan_length = length
+    scan_amount = amount
+    current_progress = 0
+    total_to_scan = amount
+    available_usernames = []
+    scan_start_time = datetime.now()
     
-    if username in monitored_usernames:
-        del monitored_usernames[username]
-        save_data()
-        await ctx.send(f"✅ Stopped monitoring `{username}`")
-    else:
-        await ctx.send(f"❌ `{username}` is not being monitored")
-
-@bot.command(name='check')
-async def check(ctx, username: str):
-    """
-    Check ANY username immediately (any length)
-    Shows detailed reason if not available
-    """
-    if ctx.author.id != YOUR_USER_ID:
-        return
+    await ctx.send(f"🔍 Starting scan: Generating {amount} random {length}-character usernames...")
     
-    username = username.lower().strip()
-    
-    # Send checking message
-    status_msg = await ctx.send(f"🔍 Checking `{username}`...")
-    
-    # Check availability with detailed response
-    result = await check_username_availability(username)
-    
-    if result["available"]:
-        await status_msg.edit(content=f"✅ **`{username}` is AVAILABLE!**")
-        # Also send DM for urgency
-        await send_instant_notification(username)
-    else:
-        # Show the specific reason
-        await status_msg.edit(content=f"❌ **`{username}` is not available**\n*Reason: {result['message']}*")
-
-@bot.command(name='list')
-async def list_monitored(ctx):
-    """List all monitored usernames and their status"""
-    if ctx.author.id != YOUR_USER_ID:
-        return
-    
-    if not monitored_usernames:
-        await ctx.send("📭 No usernames being monitored")
-        return
-    
-    # Build status list
-    status_lines = []
-    for username, data in monitored_usernames.items():
-        status = "✅ AVAILABLE" if data.get('notified') else "⏳ Monitoring"
-        added = datetime.fromisoformat(data['added_at']).strftime("%m/%d %H:%M") if 'added_at' in data else "unknown"
-        status_lines.append(f"`{username}` - {status} (added: {added})")
-    
-    # Send in chunks if too long
-    chunks = [status_lines[i:i+15] for i in range(0, len(status_lines), 15)]
-    
-    for i, chunk in enumerate(chunks):
-        if i == 0:
-            await ctx.send(f"**📋 Monitored Usernames ({len(monitored_usernames)}):**\n" + "\n".join(chunk))
-        else:
-            await ctx.send("\n".join(chunk))
-
-@bot.command(name='removeall')
-async def remove_all(ctx):
-    """Remove ALL monitored usernames"""
-    if ctx.author.id != YOUR_USER_ID:
-        return
-    
-    if not monitored_usernames:
-        await ctx.send("📭 No usernames to remove")
-        return
-    
-    count = len(monitored_usernames)
-    monitored_usernames.clear()
-    save_data()
-    
-    await ctx.send(f"✅ Removed all {count} monitored usernames")
-
-@bot.command(name='checknow')
-async def check_now(ctx):
-    """Force an immediate check of all monitored usernames"""
-    if ctx.author.id != YOUR_USER_ID:
-        return
-    
-    if not monitored_usernames:
-        await ctx.send("📭 No usernames to check")
-        return
-    
-    await ctx.send(f"🔍 Forcing check of {len(monitored_usernames)} usernames...")
-    
-    found_count = 0
-    
-    # Run checks manually
-    for username, data in list(monitored_usernames.items()):
-        if data.get('notified'):
-            continue
+    try:
+        for i in range(amount):
+            if not scanning_active:
+                break
             
-        result = await check_username_availability(username)
+            # Generate random username (using DSV method)
+            username = generate_username(length, use_letters=True, use_digits=False, use_punctuation=False)
+            
+            # Check availability
+            result = await check_username_availability(username)
+            
+            if result["available"]:
+                available_usernames.append(username)
+                await send_dm_result(username, result)
+            
+            current_progress += 1
+            
+            # Progress update every 100 checks
+            if current_progress % 100 == 0:
+                await send_progress_update()
+            
+            await asyncio.sleep(delay_between_checks)
         
-        if result["available"]:
-            await send_instant_notification(username)
-            monitored_usernames[username]['notified'] = True
-            monitored_usernames[username]['available_at'] = datetime.now().isoformat()
-            save_data()
-            await ctx.send(f"✅ `{username}` is AVAILABLE - notification sent!")
-            found_count += 1
+        # Scan complete
+        elapsed = datetime.now() - scan_start_time
+        elapsed_str = str(elapsed).split('.')[0]
         
-        await asyncio.sleep(2)
-    
-    await ctx.send(f"✅ Force check complete! Found {found_count} available usernames.")
+        await ctx.send(
+            f"✅ **Scan Complete!**\n"
+            f"Checked: {current_progress} usernames\n"
+            f"Found: {len(available_usernames)} available\n"
+            f"Time: {elapsed_str}"
+        )
+        
+        if available_usernames:
+            # Send list of found usernames
+            chunks = [available_usernames[i:i+20] for i in range(0, len(available_usernames), 20)]
+            for chunk in chunks:
+                await ctx.send("📋 Available usernames:\n" + "\n".join([f"✅ {u}" for u in chunk]))
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error during scan: {str(e)}")
+    finally:
+        scanning_active = False
 
-@bot.command(name='stats')
-async def show_stats(ctx):
-    """Show statistics about monitored usernames"""
+@bot.command(name='scanlist')
+async def scan_list(ctx):
+    """Check usernames from usernames.txt file"""
+    global scanning_active, scan_type, current_progress, total_to_scan, scan_start_time, available_usernames
+    
     if ctx.author.id != YOUR_USER_ID:
         return
     
-    total = len(monitored_usernames)
-    notified = sum(1 for d in monitored_usernames.values() if d.get('notified', False))
-    pending = total - notified
+    if scanning_active:
+        await ctx.send("❌ A scan is already in progress. Use `!stop` first.")
+        return
     
-    await ctx.send(f"**📊 Statistics:**\nTotal monitored: {total}\n✅ Available found: {notified}\n⏳ Still watching: {pending}")
+    # Check if usernames.txt exists
+    if not os.path.exists('usernames.txt'):
+        await ctx.send("❌ usernames.txt not found. Please create it with one username per line.")
+        return
+    
+    # Read usernames from file
+    with open('usernames.txt', 'r') as f:
+        usernames = [line.strip() for line in f if line.strip()]
+    
+    if not usernames:
+        await ctx.send("❌ usernames.txt is empty")
+        return
+    
+    scanning_active = True
+    scan_type = 'list'
+    current_progress = 0
+    total_to_scan = len(usernames)
+    available_usernames = []
+    scan_start_time = datetime.now()
+    
+    await ctx.send(f"🔍 Starting scan: Checking {len(usernames)} usernames from list...")
+    
+    try:
+        for username in usernames:
+            if not scanning_active:
+                break
+            
+            # Check availability
+            result = await check_username_availability(username)
+            
+            if result["available"]:
+                available_usernames.append(username)
+                await send_dm_result(username, result)
+            
+            current_progress += 1
+            
+            # Progress update every 50 checks
+            if current_progress % 50 == 0:
+                await send_progress_update()
+            
+            await asyncio.sleep(delay_between_checks)
+        
+        # Scan complete
+        elapsed = datetime.now() - scan_start_time
+        elapsed_str = str(elapsed).split('.')[0]
+        
+        await ctx.send(
+            f"✅ **Scan Complete!**\n"
+            f"Checked: {current_progress}/{total_to_scan} usernames\n"
+            f"Found: {len(available_usernames)} available\n"
+            f"Time: {elapsed_str}"
+        )
+        
+        if available_usernames:
+            # Send list of found usernames
+            chunks = [available_usernames[i:i+20] for i in range(0, len(available_usernames), 20)]
+            for chunk in chunks:
+                await ctx.send("📋 Available usernames:\n" + "\n".join([f"✅ {u}" for u in chunk]))
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error during scan: {str(e)}")
+    finally:
+        scanning_active = False
+
+@bot.command(name='stop')
+async def stop_scan(ctx):
+    """Stop the current scan"""
+    global scanning_active
+    
+    if ctx.author.id != YOUR_USER_ID:
+        return
+    
+    if scanning_active:
+        scanning_active = False
+        await ctx.send("🛑 Scan stopped")
+    else:
+        await ctx.send("❌ No scan is running")
+
+@bot.command(name='progress')
+async def show_progress(ctx):
+    """Show current scan progress"""
+    if ctx.author.id != YOUR_USER_ID:
+        return
+    
+    if not scanning_active:
+        await ctx.send("📊 No scan currently running")
+        return
+    
+    await send_progress_update()
+    await ctx.send("✅ Progress sent to DMs")
+
+@bot.command(name='results')
+async def show_results(ctx):
+    """Show all found usernames from current scan"""
+    if ctx.author.id != YOUR_USER_ID:
+        return
+    
+    if not available_usernames:
+        await ctx.send("📭 No usernames found yet")
+        return
+    
+    # Send results in chunks
+    chunks = [available_usernames[i:i+20] for i in range(0, len(available_usernames), 20)]
+    for chunk in chunks:
+        await ctx.send("📋 **Available usernames:**\n" + "\n".join([f"✅ {u}" for u in chunk]))
+
+@bot.command(name='setdelay')
+async def set_delay(ctx, seconds: float = None):
+    """Set delay between checks (seconds)"""
+    global delay_between_checks
+    
+    if ctx.author.id != YOUR_USER_ID:
+        return
+    
+    if seconds is None:
+        await ctx.send(f"⏱️ Current delay: {delay_between_checks}s")
+        return
+    
+    if seconds < 0.5:
+        await ctx.send("❌ Delay must be at least 0.5 seconds")
+        return
+    
+    delay_between_checks = seconds
+    await ctx.send(f"✅ Delay set to {seconds} seconds")
+
+@bot.command(name='config')
+async def show_config(ctx):
+    """Show current configuration"""
+    if ctx.author.id != YOUR_USER_ID:
+        return
+    
+    config_text = f"""
+**🔧 Current Configuration**
+
+**Scan Settings:**
+• Delay between checks: `{delay_between_checks}s`
+• Character sets: Letters only (a-z)
+
+**Current Status:**
+• Scan active: `{scanning_active}`
+• Type: `{scan_type or 'None'}`
+• Progress: `{current_progress}/{total_to_scan}` ({((current_progress/total_to_scan)*100) if total_to_scan > 0 else 0:.1f}%)
+• Found: `{len(available_usernames)}` usernames
+
+**Commands:**
+`!scan <length> <amount>` - Generate random usernames
+`!scanlist` - Check from file
+`!stop` - Stop scan
+`!progress` - Show progress
+`!results` - Show found usernames
+`!setdelay <seconds>` - Change delay
+`!config` - Show this menu
+"""
+    await ctx.send(config_text)
 
 @bot.command(name='commands')
 async def show_commands(ctx):
@@ -366,25 +439,29 @@ async def show_commands(ctx):
         return
     
     help_text = """
-**🔥 USERNAME HUNTER BOT - Commands**
+**🔍 DSV USERNAME CHECKER BOT - Commands**
 
-**Monitor Commands:**
-`!incheck <username>` - Add username to monitor (any length)
-`!uncheck <username>` - Stop monitoring a username  
-`!list` - Show all monitored usernames
-`!removeall` - Remove ALL monitored usernames
-`!checknow` - Force immediate check of all monitored
-`!stats` - Show monitoring statistics
+**Scan Commands:**
+`!scan <length> <amount>` - Generate and scan random usernames
+  Example: `!scan 4 1000` (checks 1000 random 4-letter usernames)
 
-**Instant Check:**
-`!check <username>` - Check ANY username immediately with detailed reason
+`!scanlist` - Check usernames from `usernames.txt` file
 
-**How It Works:**
-• Bot checks monitored usernames every 30 seconds
-• Uses reliable Discord register endpoint for accurate results
-• When a username becomes available, you get an URGENT DM
-• Click the link and claim it instantly!
-• Shows specific reason if unavailable (taken, invalid, blacklisted, etc.)
+**Control Commands:**
+`!stop` - Stop current scan
+`!progress` - Show progress in DMs
+`!results` - Show all found usernames
+`!setdelay <seconds>` - Set delay between checks (default: 2s)
+
+**Info Commands:**
+`!config` - Show current configuration
+`!commands` - Show this menu
+
+**How it works:**
+• Uses DSV's pomelo-attempt endpoint for accurate checking
+• Results are DM'd to you instantly
+• Progress updates every 100 checks
+• All found usernames are saved in memory
 
 **Status:** 🔴 STREAMING Umar
 """
@@ -396,5 +473,5 @@ if __name__ == "__main__":
         print("❌ ERROR: No token found! Set TOKEN environment variable.")
         exit(1)
     
-    print("🚀 Starting Username Hunter Bot...")
+    print("🚀 Starting DSV Bot...")
     bot.run(TOKEN)
