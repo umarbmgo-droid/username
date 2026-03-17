@@ -14,7 +14,7 @@ CHECK_INTERVAL = 30  # Seconds between checks for monitored usernames
 # ===== BOT SETUP =====
 intents = discord.Intents.default()
 intents.dm_messages = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)  # Disable default help
 
 # Store monitored usernames and notification status
 monitored_usernames = {}  # {username: {"notified": False, "added_by": user_id, "added_at": timestamp}}
@@ -318,8 +318,8 @@ async def check_now(ctx):
     
     await ctx.send("✅ Force check complete!")
 
-@bot.command(name='commands', aliases=['cmds', 'help'])
-async def custom_help(ctx):
+@bot.command(name='commands')
+async def show_commands(ctx):
     """Show all commands"""
     if ctx.author.id != YOUR_USER_ID:
         return
