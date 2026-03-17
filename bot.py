@@ -240,9 +240,30 @@ async def status(ctx):
     else:
         await ctx.send("📊 No scan currently running")
 
-@bot.command()
-async def help(ctx):
+@bot.command(name='commands', aliases=['cmds', 'h'])
+async def custom_help(ctx):
     """Show commands"""
+    if ctx.author.id != YOUR_USER_ID:
+        return
+    
+    help_text = """
+**🔍 Username Hunter Bot Commands**
+
+`!scan3` - Start scanning ALL 3-letter usernames (aaa-zzz)
+`!scan4` - Start scanning ALL 4-letter usernames (aaaa-zzzz)
+`!stop` - Stop current scan
+`!status` - Check scan progress
+`!commands` - Show this menu
+`!cmds` - Same as commands
+
+**How it works:**
+- Bot DMs you every available username it finds
+- Scroll up in DMs to see the complete list
+- Scan will take days to complete (be patient!)
+- Uses 2-second delay to avoid rate limits
+- Status shows: "watching username for umar"
+"""
+    await ctx.send(help_text)
     if ctx.author.id != YOUR_USER_ID:
         return
     
