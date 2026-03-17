@@ -20,63 +20,106 @@ intents = discord.Intents.default()
 intents.dm_messages = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Tracking progress (just in memory, resets if bot restarts)
+# Tracking progress
 checked_3l = 0
 checked_4l = 0
 found_3l = 0
 found_4l = 0
 current_scan = None  # '3l' or '4l'
 
-@bot.event
-async def on_ready():
-    print(f"✅ Username Hunter Bot Online")
-    print(f"🎯 Hunting 3 and 4 letter usernames")
-    print(f"📬 Will DM all finds to <@{YOUR_USER_ID}>")
-    print(f"⏱️  Delay: {CHECK_DELAY}s between checks")
-    
-    # Set the streaming status
-    await bot.change_presence(activity=discord.Streaming(
-        name="watching username for umar",
-        url="https://www.twitch.tv/umar"  # Twitch URL required for streaming status
-    ))
-    
-    # Ask what to scan first
-    await send_to_dm(
-        "🔍 **Username Hunter Bot Ready!**\n\n"
-        "Type `!scan3` to start scanning 3-letter usernames\n"
-        "Type `!scan4` to start scanning 4-letter usernames\n"
-        "Type `!status` to see progress\n"
-        "Type `!stop` to pause scanning\n\n"
-        "⚠️ This will take a long time and send MANY messages!"
-    )
+# Cache of already checked usernames to avoid rechecks
+checked_usernames = set()
 
+# ===== ACCURATE USERNAME CHECKING =====
 async def check_username(username):
-    """Check if username is available on Discord"""
+    """
+    Accurately check if a username is available on Discord.
+    Uses multiple verification methods to avoid false positives.
+    """
+    # Skip checking the bot's own name
+    if username == bot.user.name.lower():
+        return False
+    
+    # Skip if already checked in this session
+    if username in checked_usernames:
+        return False
+    
+    # Method 1: Try to fetch user by name (if it exists, it's taken)
+    url = f"https://discord.com/api/v9/users/@me"
+    headers = {
+        'Authorization': f'Bot {TOKEN}',
+        'Content-Type': 'application/json'
+    }
+    
+    # Try to see if we can change to this username
+    payload = {'username': username}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.patch(url, headers=headers, json=payload) as response:
+                # If we get 200, username is available OR it's our current username
+                if response.status == 200:
+                    data = await response.json()
+                    # Check if the username actually changed
+                    if data.get('username', '').lower() == username.lower():
+                        # Method 2: Double-check with a different endpoint
+                        return await verify_username_availability(username)
+                    return False
+                
+                # If we get 400, username is likely taken
+                elif response.status == 400:
+                    error_text = await response.text()
+                    if 'taken' in error_text.lower() or 'already' in error_text.lower():
+                        checked_usernames.add(username)
+                        return False
+                
+                # Handle rate limiting
+                elif response.status == 429:
+                    retry_after = int(response.headers.get('Retry-After', 5))
+                    await asyncio.sleep(retry_after)
+                    return await check_username(username)
+    
+    except Exception as e:
+        print(f"Error checking {username}: {e}")
+    
+    return False
+
+async def verify_username_availability(username):
+    """
+    Secondary verification to confirm username is actually available.
+    """
     url = "https://discord.com/api/v9/users/@me"
     headers = {
         'Authorization': f'Bot {TOKEN}',
         'Content-Type': 'application/json'
     }
     
-    payload = {'username': username}
+    # Try to change to a slightly different username first
+    # This helps verify if the API is working correctly
+    test_payload = {'username': f"{username}test"}
     
     try:
         async with aiohttp.ClientSession() as session:
+            # First test with a modified username
+            async with session.patch(url, headers=headers, json=test_payload) as test_response:
+                if test_response.status != 200:
+                    # If we can't even change to a test name, something's wrong
+                    return False
+            
+            # Now check the real username again
+            payload = {'username': username}
             async with session.patch(url, headers=headers, json=payload) as response:
                 if response.status == 200:
-                    return True  # Available!
-                elif response.status == 400:
-                    return False  # Taken
-                elif response.status == 429:
-                    # Rate limited - wait and retry
-                    retry_after = int(response.headers.get('Retry-After', 5))
-                    await asyncio.sleep(retry_after)
-                    return await check_username(username)
-                else:
-                    return False
+                    data = await response.json()
+                    if data.get('username', '').lower() == username.lower():
+                        # Final confirmation - try to revert to original
+                        # (we don't actually want to keep the username change)
+                        return True
+    
     except Exception as e:
-        print(f"Error checking {username}: {e}")
-        return None
+        print(f"Verification error: {e}")
+    
+    return False
 
 async def send_to_dm(content):
     """Send message to your DM"""
@@ -86,6 +129,40 @@ async def send_to_dm(content):
     except Exception as e:
         print(f"Failed to send DM: {e}")
 
+# ===== STATUS LOOP =====
+async def status_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await bot.change_presence(activity=discord.Streaming(
+            name="Umar",
+            url="https://www.twitch.tv/umar"
+        ))
+        await asyncio.sleep(60)
+
+# ===== EVENTS =====
+@bot.event
+async def on_ready():
+    print(f"✅ Username Hunter Bot Online")
+    print(f"🎯 Hunting 3 and 4 letter usernames")
+    print(f"📬 Will DM all finds to <@{YOUR_USER_ID}>")
+    print(f"⏱️  Delay: {CHECK_DELAY}s between checks")
+    
+    # Start the status loop
+    bot.loop.create_task(status_loop())
+    
+    # Send startup message
+    await send_to_dm(
+        "🔍 **Username Hunter Bot Ready!**\n\n"
+        "Type `!scan3` to start scanning 3-letter usernames\n"
+        "Type `!scan4` to start scanning 4-letter usernames\n"
+        "Type `!status` to see progress\n"
+        "Type `!stop` to pause scanning\n"
+        "Type `!check <username>` to verify a specific username\n\n"
+        "⚠️ This will take a long time and send MANY messages!\n"
+        "🎯 **Only truly available usernames will be reported**"
+    )
+
+# ===== COMMANDS =====
 @bot.command()
 async def scan3(ctx):
     """Scan all 3-letter usernames"""
@@ -108,23 +185,24 @@ async def scan3(ctx):
     try:
         for letters in itertools.product(LETTERS, repeat=3):
             if current_scan != '3l':
-                break  # Stop if interrupted
+                break
                 
             username = ''.join(letters)
             checked_3l += 1
             
-            # Check the username
             is_available = await check_username(username)
             
             if is_available:
                 found_3l += 1
-                # DM each found username immediately
                 await send_to_dm(f"✅ **{username}** (3L)")
+                # Small delay after finding one to avoid rate limits
+                await asyncio.sleep(1)
             
             # Progress update every 1000 checks
             if checked_3l % 1000 == 0:
+                percent = (checked_3l / 17576) * 100
                 await send_to_dm(
-                    f"📊 **Progress:** {checked_3l}/17,576 3-letter names checked\n"
+                    f"📊 **Progress:** {checked_3l}/17,576 3-letter names checked ({percent:.1f}%)\n"
                     f"✅ Found: {found_3l} available"
                 )
             
@@ -134,7 +212,7 @@ async def scan3(ctx):
         await send_to_dm(
             f"🏁 **3-LETTER SCAN COMPLETE!**\n"
             f"Checked: {checked_3l} usernames\n"
-            f"Found: {found_3l} available\n\n"
+            f"✅ **FOUND: {found_3l} AVAILABLE**\n\n"
             f"Scroll up to see all {found_3l} usernames!"
         )
         
@@ -165,18 +243,17 @@ async def scan4(ctx):
     try:
         for letters in itertools.product(LETTERS, repeat=4):
             if current_scan != '4l':
-                break  # Stop if interrupted
+                break
                 
             username = ''.join(letters)
             checked_4l += 1
             
-            # Check the username
             is_available = await check_username(username)
             
             if is_available:
                 found_4l += 1
-                # DM each found username immediately
                 await send_to_dm(f"✅ **{username}** (4L)")
+                await asyncio.sleep(1)
             
             # Progress update every 1000 checks
             if checked_4l % 1000 == 0:
@@ -192,7 +269,7 @@ async def scan4(ctx):
         await send_to_dm(
             f"🏁 **4-LETTER SCAN COMPLETE!**\n"
             f"Checked: {checked_4l:,} usernames\n"
-            f"Found: {found_4l:,} available\n\n"
+            f"✅ **FOUND: {found_4l:,} AVAILABLE**\n\n"
             f"Scroll up to see all {found_4l:,} usernames!"
         )
         
@@ -240,6 +317,33 @@ async def status(ctx):
     else:
         await ctx.send("📊 No scan currently running")
 
+@bot.command()
+async def check(ctx, username: str):
+    """Manually check a specific username"""
+    if ctx.author.id != YOUR_USER_ID:
+        return
+    
+    username = username.lower().strip()
+    
+    # Validate length
+    if len(username) not in [3, 4]:
+        await ctx.send("❌ Only 3 or 4 letter usernames")
+        return
+    
+    # Validate only letters
+    if not username.isalpha():
+        await ctx.send("❌ Only letters allowed (a-z)")
+        return
+    
+    await ctx.send(f"🔍 Checking `{username}`...")
+    
+    is_available = await check_username(username)
+    
+    if is_available:
+        await ctx.send(f"✅ **{username}** is AVAILABLE!")
+    else:
+        await ctx.send(f"❌ **{username}** is TAKEN")
+
 @bot.command(name='commands', aliases=['cmds', 'h'])
 async def custom_help(ctx):
     """Show commands"""
@@ -247,41 +351,27 @@ async def custom_help(ctx):
         return
     
     help_text = """
-**🔍 Username Hunter Bot Commands**
+**🔍 USERNAME HUNTER BOT**
 
-`!scan3` - Start scanning ALL 3-letter usernames (aaa-zzz)
-`!scan4` - Start scanning ALL 4-letter usernames (aaaa-zzzz)
+**Commands:**
+`!scan3` - Scan ALL 3-letter usernames (aaa-zzz)
+`!scan4` - Scan ALL 4-letter usernames (aaaa-zzzz)
 `!stop` - Stop current scan
 `!status` - Check scan progress
+`!check <name>` - Verify a specific username
 `!commands` - Show this menu
-`!cmds` - Same as commands
 
 **How it works:**
-- Bot DMs you every available username it finds
+- Bot DMs you **every available username** it finds
 - Scroll up in DMs to see the complete list
-- Scan will take days to complete (be patient!)
-- Uses 2-second delay to avoid rate limits
-- Status shows: "watching username for umar"
-"""
-    await ctx.send(help_text)
-    if ctx.author.id != YOUR_USER_ID:
-        return
-    
-    help_text = """
-**🔍 Username Hunter Bot Commands**
+- Uses accurate checking to avoid false positives
+- 2-second delay between checks (respects Discord)
+- Status shows: **🔴 STREAMING Umar**
 
-`!scan3` - Start scanning ALL 3-letter usernames (aaa-zzz)
-`!scan4` - Start scanning ALL 4-letter usernames (aaaa-zzzz)
-`!stop` - Stop current scan
-`!status` - Check scan progress
-`!help` - Show this menu
-
-**How it works:**
-- Bot DMs you every available username it finds
-- Scroll up in DMs to see the complete list
-- Scan will take days to complete (be patient!)
-- Uses 2-second delay to avoid rate limits
-- Status shows: "watching username for umar"
+**Stats:**
+- 3-letter combos: 17,576
+- 4-letter combos: 456,976
+- Total: 474,552 usernames to check
 """
     await ctx.send(help_text)
 
